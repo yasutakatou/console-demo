@@ -28,6 +28,9 @@ import (
   "strings"
   "time"
   "bytes"
+  "golang.org/x/text/encoding"
+  "golang.org/x/text/encoding/unicode"
+  "github.com/acarl005/stripansi"
 )
 
 var tty *os.File
@@ -40,6 +43,7 @@ const patternLen = 5
 var port string = "32000"
 var webAssetsDir string
 var passwd string
+var wsoc *websocket.Conn
 
 type Handler struct {
   fileServer http.Handler
@@ -56,8 +60,10 @@ var ignoredInputs = [][patternLen]byte{
 }
 
 func main() {
+  _org          := flag.String("org","http://localhost:8080/","[-org=ORIGIN URL]")
+  _ws           := flag.String("ws","ws://localhost:8080/ws","[-ws=WEB SOCKET URL]")
   _passwd       := flag.String("passwd","passwd","[-token=ACCESS PASSWORD]")
-  _webAssetsDir := flag.String("html","/var/www/html","[-html=HTML DIR]")
+  _webAssetsDir := flag.String("html","./www","[-html=HTML DIR]")
   _command      := flag.String("command","/bin/bash","[-command=EXECUTE COMMAND]")
   _port         := flag.String("port","32000","[-port=LISTENING PORT]")
   _debug        := flag.Bool("debug",false,"[-debug=DEBUG MODE]")
@@ -66,6 +72,8 @@ func main() {
 
   flag.Parse()
 
+  org               := string(*_org)
+  ws                := string(*_ws)
   passwd             = string(*_passwd)
   webAssetsDir       = string(*_webAssetsDir)
   command           := string(*_command)
@@ -76,6 +84,7 @@ func main() {
 
   if debug == true {
     fmt.Println(" ---------")
+    fmt.Println(" |ws     | " + ws)
     fmt.Println(" |passwd | " + passwd)
     fmt.Println(" |html   | " + webAssetsDir)
     fmt.Println(" |command| " + command)
@@ -87,6 +96,8 @@ func main() {
   }
 
   // - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = - = -
+
+  wsoc, _ = websocket.Dial(ws, "", org)
 
   cmd := exec.Command(os.Getenv("SHELL"), "-c",command)
   tty, _ = pty.Start(cmd)
@@ -183,12 +194,6 @@ func onShell(w http.ResponseWriter, r *http.Request) {
   websocket.Handler(wsHandler).ServeHTTP(w, r)
 }
 
-func Exists(name string) bool {
-    _, err := os.Stat(name)
-    return !os.IsNotExist(err)
-}
-
-
 func (this *InputWrapper) Read(out []byte) (n int, err error) {
   var data []byte
   err = websocket.Message.Receive(this.ws, &data)
@@ -209,12 +214,115 @@ func (this *InputWrapper) Read(out []byte) (n int, err error) {
   return copy(out, data), nil
 }
 
-func execmd(command string) string {
-  out, err := exec.Command(os.Getenv("SHELL"), "-c", command + " 2>&1 | tee").Output()
-  if err != nil {
-    fmt.Println(err)
-    return ""
+/*
+Copyright 2015 Gravitational, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// WebSockWrapper wraps the raw websocket and converts Write() calls
+// to proper websocket.Send() working in binary or text mode. If text
+// mode is selected, it converts the data passed to Write() into UTF8 bytes
+//
+// We need this to make sure that the entire buffer in io.Writer.Write(buffer)
+// is delivered as a single chunk to the web browser, instead of being split
+// into multiple frames. This wrapper basically substitues every Write() with
+// Send() and every Read() with Receive()
+
+type WebSockWrapper struct {
+	io.ReadWriteCloser
+
+	ws   *websocket.Conn
+	mode WebSocketMode
+
+	encoder *encoding.Encoder
+	decoder *encoding.Decoder
+}
+
+// WebSocketMode allows to create WebSocket wrappers working in text
+// or binary mode
+type WebSocketMode int
+
+const (
+	WebSocketBinaryMode = iota
+	WebSocketTextMode
+)
+
+func NewWebSockWrapper(ws *websocket.Conn, m WebSocketMode) *WebSockWrapper {
+	if ws == nil {
+		return nil
+	}
+	return &WebSockWrapper{
+		ws:      ws,
+		mode:    m,
+		encoder: unicode.UTF8.NewEncoder(),
+		decoder: unicode.UTF8.NewDecoder(),
+	}
+}
+
+// Write implements io.WriteCloser for WebSockWriter (that's the reason we're
+// wrapping the websocket)
+//
+// It replaces raw Write() with "Message.Send()"
+func (w *WebSockWrapper) Write(data []byte) (n int, err error) {
+	n = len(data)
+	if w.mode == WebSocketBinaryMode {
+		// binary send:
+		err = websocket.Message.Send(w.ws, data)
+		// text send:
+	} else {
+		var utf8 string
+		utf8, err = w.encoder.String(string(data))
+		err = websocket.Message.Send(w.ws, utf8)
+		sendMsg(wsoc, stripansi.Strip(string(utf8)))
+	}
+	if err != nil {
+		n = 0
+	}
+	return n, err
+}
+
+func sendMsg(ws *websocket.Conn, msg string) {
+  websocket.JSON.Send(ws, msg)
+  if debug == true {
+    fmt.Println("Send data=%#v\n", msg)
   }
-  fmt.Printf("local exec command: %s : %s\n", command, out)
-  return strings.Replace(string(out),"\n","",-1)
+}
+
+// Read does the opposite of write: it replaces websocket's raw "Read" with
+//
+// It replaces raw Read() with "Message.Receive()"
+func (w *WebSockWrapper) Read(out []byte) (n int, err error) {
+	var data []byte
+
+	if w.mode == WebSocketBinaryMode {
+		err = websocket.Message.Receive(w.ws, &data)
+	} else {
+		var utf8 string
+		err = websocket.Message.Receive(w.ws, &utf8)
+		switch err {
+		case nil:
+			data, err = w.decoder.Bytes([]byte(utf8))
+		case io.EOF:
+			return 0, io.EOF
+		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	return copy(out, data), nil
+}
+
+func (w *WebSockWrapper) Close() error {
+	return w.ws.Close()
 }
